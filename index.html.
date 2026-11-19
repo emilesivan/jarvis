@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>JARVIS</title>
+<style>
+  html,body{margin:0;height:100%;background:radial-gradient(circle at 50% 55%,#06324a,#020b12 70%);
+    color:#7df3ff;font-family:system-ui,sans-serif;overflow:hidden}
+  #title{position:fixed;top:18px;width:100%;text-align:center;letter-spacing:.5em;font-weight:700;
+    text-shadow:0 0 12px #00cfff}
+  canvas{position:fixed;inset:0;width:100%;height:100%}
+  #log{position:fixed;bottom:70px;width:100%;text-align:center;padding:0 24px;box-sizing:border-box;
+    font-size:15px;opacity:.85;min-height:44px}
+  #bar{position:fixed;bottom:16px;width:100%;display:flex;justify-content:center;gap:8px}
+  button,input{background:#06202e;color:#7df3ff;border:1px solid #138bb0;border-radius:8px;padding:10px 14px}
+  input{width:min(60vw,360px)}
+</style>
+</head>
+<body>
+<div id="title">JARVIS</div>
+<canvas id="c"></canvas>
+<div id="log">Tap anywhere to wake Jarvis.</div>
+<div id="bar">
+  <input id="txt" placeholder="Or type a message...">
+  <button id="send">Send</button>
+  <button id="keys">Keys</button>
+</div>
+
+<script>
+// ---------- Config (keys live only in this browser tab/localStorage) ----------
+const cfg = {
+  groq: localStorage.groq || "",
+  eleven: localStorage.eleven || "",
+  voice: localStorage.voice || "JBFqnCBsd6RMkjVDRZzb",   // any ElevenLabs voice ID
+  model: "llama-3.3-70b-versatile"
+};
+const SYSTEM = "You are JARVIS, a witty, calm, highly capable AI assistant in the style of Tony Stark's. " +
+  "Address the user as 'sir' occasionally. Keep replies short (1-3 sentences) since they are spoken aloud.";
+let history = [{role:"system", content:SYSTEM}];
+let state = "idle";              // idle | listening | thinking | speaking
+let level = 0;                   // audio level 0..1 while speaking
+const $ = id => document.getElementById(id);
+const log = t => $("log").textContent = t;
+
+$("keys").onclick = e => {
+  e.stopPropagation();
+  cfg.groq = prompt("Groq API key:", cfg.groq) || cfg.groq;
+  cfg.eleven = prompt("ElevenLabs API key (optional):", cfg.eleven) || cfg.eleven;
+  cfg.voice = prompt("ElevenLabs voice ID:", cfg.voice) || cfg.voice;
+  Object.assign(localStorage, {groq:cfg.groq, eleven:cfg.eleven, voice:cfg.voice});
+};
+
+// ---------- LLM (Groq, OpenAI-compatible) ----------
+async function think(userText){
+  state = "thinking"; log("Thinking...");
+  history.push({role:"user", content:userText});
+  const r = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+    method:"POST",
+    headers:{"Content-Type":"application/json","Authorization":"Bearer "+cfg.groq},
+    body:JSON.stringify({model:cfg.model, messages:history.slice(-20), temperature:0.7})
+  });
+  if(!r.ok) throw new Error("Groq error "+r.status);
+  const reply = (await r.json()).choices[0].message.content;
+  history.push({role:"assistant", content:reply});
+  return reply;
+}
+
+// ---------- Voice out (ElevenLabs, fallback to browser TTS) ----------
+let actx, analyser, data;
+function setupAudio(){
+  actx = actx || new (window.AudioContext||window.webkitAudioContext)();
+  if(!analyser){ analyser = actx.createAnalyser(); analyser.fftSize = 256;
+    data = new Uint8Array(analyser.frequencyBinCount); analyser.connect(actx.destination); }
+}
+async function speak(text){
+  state = "speaking"; log(text);
+  setupAudio();
+  try{
+    if(!cfg.eleven) throw 0;
+    const r = await fetch("https://api.elevenlabs.io/v1/text-to-speech/"+cfg.voice, {
+      method:"POST",
+      headers:{"xi-api-key":cfg.eleven,"Content-Type":"application/json"},
+      body:JSON.stringify({text, model_id:"eleven_turbo_v2_5"})
+    });
+    if(!r.ok) throw 0;
+    const buf = await actx.decodeAudioData(await r.arrayBuffer());
+    await new Promise(res=>{
+      const s = actx.createBufferSource(); s.buffer = buf; s.connect(analyser);
+      s.onended = res; s.start();
+    });
+  }catch(e){
+    await new Promise(res=>{
+      const u = new SpeechSynthesisUtterance(text); u.onend = res; u.onerror = res;
+      u.onboundary = ()=>{ level = 0.8; };
+      speechSynthesis.speak(u);
+    });
+  }
+  state = "idle";
+}
+
+// ---------- Voice in (Web Speech API) ----------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let rec, busy = false;
+function listen(){
+  if(!SR){ log("Speech recognition not supported - type instead."); return; }
+  if(busy) return;
+  rec = new SR(); rec.lang = "en-US"; rec.interimResults = false;
+  rec.onstart = ()=>{ state="listening"; log("Listening..."); };
+  rec.onresult = e => handle(e.results[0][0].transcript);
+  rec.onerror = ()=>{ state="idle"; };
+  rec.onend = ()=>{ if(state==="listening") state="idle"; };
+  rec.start();
+}
+
+async function handle(text){
+  if(!text.trim() || busy) return;
+  if(!cfg.groq){ log("Add your Groq key with the Keys button."); return; }
+  busy = true;
+  try{ await speak(await think(text)); }
+  catch(e){ state="idle"; log("Error: "+e.message); }
+  busy = false;
+}
+
+document.body.addEventListener("click", e=>{
+  if(e.target.closest("#bar")) return;
+  setupAudio(); if(actx.state==="suspended") actx.resume();
+  listen();
+});
+$("send").onclick = ()=>{ const t=$("txt").value; $("txt").value=""; handle(t); };
+$("txt").onkeydown = e=>{ if(e.key==="Enter") $("send").click(); };
+
+// ---------- Orb animation ----------
+const cv = $("c"), g = cv.getContext("2d");
+const stars = Array.from({length:140}, ()=>({a:Math.random()*6.28, r:Math.random(), s:Math.random()*0.002+0.0005}));
+function resize(){ cv.width = innerWidth*devicePixelRatio; cv.height = innerHeight*devicePixelRatio; }
+addEventListener("resize", resize); resize();
+
+function frame(t){
+  const W = cv.width, H = cv.height, cx = W/2, cy = H*0.5, base = Math.min(W,H)*0.16;
+  g.clearRect(0,0,W,H);
+
+  if(state==="speaking" && analyser){
+    analyser.getByteFrequencyData(data);
+    level = data.reduce((a,b)=>a+b,0)/data.length/128;
+  } else level *= 0.92;
+
+  const pulse = state==="listening" ? 0.08*Math.sin(t/180)
+              : state==="thinking"  ? 0.05*Math.sin(t/90)
+              : 0.03*Math.sin(t/700);
+  const R = base*(1 + pulse + level*0.35);
+
+  // particles
+  g.fillStyle = "#9defff";
+  stars.forEach(p=>{
+    p.a += p.s*(state==="thinking"?6:1);
+    const d = base*(1.6+p.r*2.2);
+    g.globalAlpha = 0.25+0.5*p.r;
+    g.fillRect(cx+Math.cos(p.a)*d, cy+Math.sin(p.a)*d, 2, 2);
+  });
+  g.globalAlpha = 1;
+
+  // glowing core
+  const grd = g.createRadialGradient(cx,cy,0,cx,cy,R);
+  grd.addColorStop(0,"#ffffff"); grd.addColorStop(0.25,"#44e1ff");
+  grd.addColorStop(1,"rgba(0,150,255,0)");
+  g.fillStyle = grd; g.beginPath(); g.arc(cx,cy,R*1.4,0,6.28); g.fill();
+
+  // tick ring (rotates, faster while thinking)
+  const spin = t/(state==="thinking"?400:2500);
+  g.strokeStyle = "rgba(125,243,255,.75)"; g.lineWidth = 2;
+  for(let i=0;i<72;i++){
+    const a = spin + i*Math.PI/36, r1 = base*1.55, r2 = r1+base*(i%6===0?0.22:0.12);
+    g.beginPath(); g.moveTo(cx+Math.cos(a)*r1, cy+Math.sin(a)*r1);
+    g.lineTo(cx+Math.cos(a)*r2, cy+Math.sin(a)*r2); g.stroke();
+  }
+  g.lineWidth = 1; g.beginPath(); g.arc(cx,cy,base*1.4,0,6.28); g.stroke();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
